@@ -11,7 +11,7 @@ mkdir -p "$STATE_DIR"
 
 now_epoch() { date +%s; }
 
-# Calculate peer .1<->.2 in /30 (simple heuristic)
+# Calculate peer .1<->.2 in /30
 calc_peer_ip() {
   local local_ip="$1"
   if [[ "$local_ip" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.1$ ]]; then
@@ -28,6 +28,7 @@ ping_loss_pct_fast() {
   local src_ip="$1"
   local dst_ip="$2"
   local out loss
+
   out=$(/bin/ping -c 20 -i 0.2 -W 1 -w 6 -I "$src_ip" "$dst_ip" 2>&1 || true)
   loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | head -n1 | cut -d% -f1 || true)
   if [[ -z "${loss:-}" ]]; then
@@ -88,6 +89,10 @@ update_state_for_result() {
   local tid="$1" is_good="$2" step="$3"
   load_state "$tid"
 
+  if (( last_ts <= 0 )); then
+    last_ts="$(now_epoch)"
+  fi
+
   if (( is_good == 1 )); then
     good_streak=$((good_streak + step))
     bad_streak=0
@@ -132,10 +137,12 @@ select_backends() {
 }
 
 declare -A TID2PEER=()
+declare -A TID2IFACE=()
 declare -A TID2LOCAL=()
 
 refresh_tunnel_map() {
   TID2PEER=()
+  TID2IFACE=()
   TID2LOCAL=()
 
   local ifc tid local_ip peer_ip
@@ -151,6 +158,7 @@ refresh_tunnel_map() {
     [[ -n "$peer_ip" ]] || continue
 
     TID2PEER["$tid"]="$peer_ip"
+    TID2IFACE["$tid"]="$ifc"
     TID2LOCAL["$tid"]="$local_ip"
   done < <(discover_gre_ifaces || true)
 }
@@ -182,7 +190,9 @@ main() {
 
   local -a tids=()
   local tid
-  for tid in "${!TID2PEER[@]}"; do tids+=("$tid"); done
+  for tid in "${!TID2PEER[@]}"; do
+    tids+=("$tid")
+  done
 
   if (( ${#tids[@]} == 0 )); then
     echo "[gost-autobalance] No GRE tunnel IPs found."
@@ -192,7 +202,6 @@ main() {
   IFS=$'\n' tids=($(printf "%s\n" "${tids[@]}" | sort -n))
   unset IFS
 
-  # Evaluate each tunnel loss and update state
   local loss local_ip peer_ip is_good
   for tid in "${tids[@]}"; do
     local_ip="${TID2LOCAL[$tid]:-}"
@@ -208,6 +217,7 @@ main() {
   done
 
   mapfile -t chosen < <(select_backends "${tids[@]}" || true)
+
   if (( ${#chosen[@]} == 0 )); then
     echo "[gost-autobalance] No usable tunnels yet (waiting for GOOD_FOR). Keeping existing config."
     exit 0
@@ -216,21 +226,20 @@ main() {
   local tmp_ports; tmp_ports="$(mktemp)"
   trap 'rm -f "$tmp_ports"' EXIT
 
-  # Build /etc/gost_ports.txt content (round-robin across chosen)
   {
-    IFS=',' read -r -a ports <<< "$PORTS_CSV"
+    local ports_csv="$PORTS_CSV"
+    IFS=',' read -r -a ports <<< "$ports_csv"
     unset IFS
 
     declare -A ip2ports=()
-    local idx=0 p tid ip
+    local idx=0
+    local p tid ip
     for p in "${ports[@]}"; do
       p="$(printf '%s' "$p" | tr -d '[:space:]')"
       [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
-
       tid="${chosen[$(( idx % ${#chosen[@]} ))]}"
       ip="${TID2PEER[$tid]:-}"
       [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
-
       if [[ -z "${ip2ports[$ip]:-}" ]]; then
         ip2ports["$ip"]="$p"
       else
@@ -247,9 +256,11 @@ main() {
     done
   } > "$tmp_ports"
 
-  [[ -s "$tmp_ports" ]] || exit 0
+  if [[ ! -s "$tmp_ports" ]]; then
+    echo "[gost-autobalance] Failed to build gost_ports (unexpected)."
+    exit 0
+  fi
 
-  # If unchanged, do nothing
   if [[ -f "$GOST_PORTS_FILE" ]] && cmp -s "$tmp_ports" "$GOST_PORTS_FILE"; then
     exit 0
   fi
