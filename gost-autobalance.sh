@@ -207,35 +207,90 @@ refresh_tunnel_map() {
 }
 
 # Generate /etc/gost_ports.txt based on selected tids + ports distribution
+parse_ports_csv() {
+  # PORTS_CSV items may be:
+  #   8081
+  #   8081:2
+  # Meaning: port 8081 with weight 2 (counts like 2 ports for balancing).
+  # Outputs: two arrays (ports + weights).
+  local csv="$1"
+  local -n PORTS_OUT="$2"
+  local -n WEIGHTS_OUT="$3"
+
+  PORTS_OUT=()
+  WEIGHTS_OUT=()
+
+  local item port w
+  IFS=',' read -r -a items <<< "$csv"
+  unset IFS
+  for item in "${items[@]}"; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [[ -n "$item" ]] || continue
+
+    port="${item%%:*}"
+    w="${item#*:}"
+    if [[ "$item" == "$port" ]]; then
+      w="1"
+    fi
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+    (( port >= 1 && port <= 65535 )) || continue
+    [[ "$w" =~ ^[0-9]+$ ]] || w="1"
+    (( w < 1 )) && w=1
+    (( w > 100 )) && w=100
+
+    PORTS_OUT+=("$port")
+    WEIGHTS_OUT+=("$w")
+  done
+}
+
 write_gost_ports() {
   local -a backends=("$@")
-  local ports_csv="$PORTS_CSV"
-  IFS=',' read -r -a ports <<< "$ports_csv"
-  unset IFS
-
   (( ${#backends[@]} > 0 )) || return 1
 
-  # round-robin distribution
+  local -a ports weights
+  parse_ports_csv "$PORTS_CSV" ports weights
+  (( ${#ports[@]} > 0 )) || return 1
+
+  # Weighted greedy assignment: assign each port to the backend with the lowest current load.
+  # Load = sum(weights). Default weight=1; e.g. 8801:3 counts like 3 ports.
   declare -A ip2ports=()
-  local idx=0
-  local p tid ip
-  for p in "${ports[@]}"; do
-    p="$(printf '%s' "$p" | tr -d '[:space:]')"
-    [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+  declare -A ip2load=()
 
-    tid="${backends[$(( idx % ${#backends[@]} ))]}"
+  local tid ip i best_ip best_load cur_load w p
+  for tid in "${backends[@]}"; do
     ip="${TID2PEER[$tid]:-}"
-    [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
-
-    if [[ -z "${ip2ports[$ip]:-}" ]]; then
-      ip2ports["$ip"]="$p"
-    else
-      ip2ports["$ip"]+=",${p}"
-    fi
-    idx=$((idx+1))
+    [[ -n "$ip" ]] || continue
+    ip2load["$ip"]=0
+    ip2ports["$ip"]=""
   done
 
-  # stable ordering by tid numeric
+  for i in "${!ports[@]}"; do
+    p="${ports[$i]}"
+    w="${weights[$i]}"
+
+    best_ip=""
+    best_load=0
+
+    for tid in "${backends[@]}"; do
+      ip="${TID2PEER[$tid]:-}"
+      [[ -n "$ip" ]] || continue
+      cur_load="${ip2load[$ip]:-0}"
+      if [[ -z "$best_ip" || "$cur_load" -lt "$best_load" ]]; then
+        best_ip="$ip"
+        best_load="$cur_load"
+      fi
+    done
+
+    [[ -n "$best_ip" ]] || continue
+    if [[ -z "${ip2ports[$best_ip]:-}" ]]; then
+      ip2ports["$best_ip"]="$p"
+    else
+      ip2ports["$best_ip"]+=",${p}"
+    fi
+    ip2load["$best_ip"]=$(( ${ip2load[$best_ip]:-0} + w ))
+  done
+
   local tmp; tmp="$(mktemp)"
   for tid in "${backends[@]}"; do
     ip="${TID2PEER[$tid]:-}"
@@ -253,6 +308,7 @@ write_gost_ports() {
   rm -f "$tmp"
   return 0
 }
+
 
 # Build gost args file exactly like your snippet
 rebuild_gost_args_and_restart() {
@@ -384,69 +440,23 @@ gost_port_map() {
     return 0
   fi
 
-  # Build mapping: DST_IP -> PEER_IP (public) by inspecting GRE interfaces
-  declare -A dst2peer=()
-  local ifc tid local_tun_ip dst_ip link_line peer_pub
-  while read -r ifc; do
-    [[ -n "$ifc" ]] || continue
-    ifc="${ifc%%@*}"
-    local_tun_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
-    [[ -n "$local_tun_ip" ]] || continue
-    dst_ip="$(calc_peer_ip "$local_tun_ip")"
-    [[ -n "$dst_ip" ]] || continue
-
-    link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | grep -m1 "link/gre" || true)
-    peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
-    [[ -n "${peer_pub:-}" ]] || peer_pub="-"
-
-    # keep first seen (usually the lowest IFACE id for that dst)
-    if [[ -z "${dst2peer[$dst_ip]:-}" ]]; then
-      dst2peer["$dst_ip"]="$peer_pub"
-    fi
-  done < <(/sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^gre-(ir|kh)-[0-9]+' | sort -u)
-
-  # Read /etc/gost_ports.txt and print grouped ports per DST_IP
   echo
-  awk -v OFS="\t" -v NC="$NC" '
-    BEGIN {
-      print "DST_IP\t\tPEER_IP\t\tPORTS"
-      print "---------------\t---------------\t-------------------------"
-    }
-    /^[[:space:]]*$/ {next}
-    /^[[:space:]]*#/ {next}
-    {
-      ip=$0
-      sub(/:.*/, "", ip)
-      ports=$0
-      sub(/^[^:]*:/, "", ports)
-      gsub(/[[:space:]]/, "", ports)
-      map[ip]=ports
-      order[++n]=ip
-    }
-    END {
-      # Preserve file order
-      for (i=1;i<=n;i++) {
-        ip=order[i]
-        if (ip in map) {
-          # placeholder PEER_IP; replaced in bash loop below if needed
-          print ip, "-", map[ip]
-        }
-      }
-    }
-  ' "$GOST_PORTS_FILE" | while IFS=$'\t' read -r dip peer ports; do
-      # dip might have extra spacing in header lines; pass through
-      if [[ "$dip" == "DST_IP"* || "$dip" == "---------------"* ]]; then
-        # Reformat spacing for header/separator
-        if [[ "$dip" == "DST_IP"* ]]; then
-          printf "%-16s %-16s %s\n" "DST_IP" "PEER_IP" "PORTS"
-        else
-          printf "%-16s %-16s %s\n" "---------------" "---------------" "-------------------------"
-        fi
-        continue
-      fi
-      peer_ip="${dst2peer[$dip]:--}"
-      printf "%-16s %-16s %s\n" "$dip" "$peer_ip" "$ports"
+  echo "PORT   -> BACKEND_IP"
+  echo "-----     ----------------"
+  while IFS= read -r rawline; do
+    line="$(printf '%s' "$rawline" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+    case "$line" in \#*) continue ;; esac
+    ip="${line%%:*}"
+    ports_csv="${line#*:}"
+    IFS=',' read -r -a ports <<< "$ports_csv"
+    for p in "${ports[@]}"; do
+      p="$(printf '%s' "$p" | tr -d '[:space:]')"
+      [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+      printf "%-7s %-16s\n" "$p" "$ip"
     done
+    unset IFS
+  done < "$GOST_PORTS_FILE" | sort -n
 }
 
 show_status() {
@@ -531,34 +541,48 @@ main() {
   local tmp_args;  tmp_args="$(mktemp)"
   trap 'rm -f "$tmp_ports" "$tmp_args"' EXIT
 
-  # Write temp gost_ports
+  # Write temp gost_ports (weighted greedy assignment)
   {
-    # Generate in memory similar to write_gost_ports but to tmp
-    local ports_csv="$PORTS_CSV"
-    IFS=',' read -r -a ports <<< "$ports_csv"
-    unset IFS
+    local -a ports weights
+    parse_ports_csv "$PORTS_CSV" ports weights
 
     declare -A ip2ports=()
-    local idx=0
-    local p tid ip
-    for p in "${ports[@]}"; do
-      p="$(printf '%s' "$p" | tr -d '[:space:]')"
-      [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+    declare -A ip2load=()
 
-      tid="${chosen[$(( idx % ${#chosen[@]} ))]}"
+    local tid ip i best_ip best_load cur_load w p
+    for tid in "${chosen[@]}"; do
       ip="${TID2PEER[$tid]:-}"
-      [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
-
-      if [[ -z "${ip2ports[$ip]:-}" ]]; then
-        ip2ports["$ip"]="$p"
-      else
-        ip2ports["$ip"]+=",${p}"
-      fi
-
-      idx=$((idx+1))
+      [[ -n "$ip" ]] || continue
+      ip2load["$ip"]=0
+      ip2ports["$ip"]=""
     done
 
-    # stable ordering by chosen tids
+    for i in "${!ports[@]}"; do
+      p="${ports[$i]}"
+      w="${weights[$i]}"
+
+      best_ip=""
+      best_load=0
+
+      for tid in "${chosen[@]}"; do
+        ip="${TID2PEER[$tid]:-}"
+        [[ -n "$ip" ]] || continue
+        cur_load="${ip2load[$ip]:-0}"
+        if [[ -z "$best_ip" || "$cur_load" -lt "$best_load" ]]; then
+          best_ip="$ip"
+          best_load="$cur_load"
+        fi
+      done
+
+      [[ -n "$best_ip" ]] || continue
+      if [[ -z "${ip2ports[$best_ip]:-}" ]]; then
+        ip2ports["$best_ip"]="$p"
+      else
+        ip2ports["$best_ip"]+=",${p}"
+      fi
+      ip2load["$best_ip"]=$(( ${ip2load[$best_ip]:-0} + w ))
+    done
+
     for tid in "${chosen[@]}"; do
       ip="${TID2PEER[$tid]:-}"
       [[ -n "$ip" ]] || continue
