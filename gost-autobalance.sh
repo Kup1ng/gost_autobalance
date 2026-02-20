@@ -207,90 +207,35 @@ refresh_tunnel_map() {
 }
 
 # Generate /etc/gost_ports.txt based on selected tids + ports distribution
-parse_ports_csv() {
-  # PORTS_CSV items may be:
-  #   8081
-  #   8081:2
-  # Meaning: port 8081 with weight 2 (counts like 2 ports for balancing).
-  # Outputs: two arrays (ports + weights).
-  local csv="$1"
-  local -n PORTS_OUT="$2"
-  local -n WEIGHTS_OUT="$3"
-
-  PORTS_OUT=()
-  WEIGHTS_OUT=()
-
-  local item port w
-  IFS=',' read -r -a items <<< "$csv"
-  unset IFS
-  for item in "${items[@]}"; do
-    item="$(printf '%s' "$item" | tr -d '[:space:]')"
-    [[ -n "$item" ]] || continue
-
-    port="${item%%:*}"
-    w="${item#*:}"
-    if [[ "$item" == "$port" ]]; then
-      w="1"
-    fi
-
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
-    (( port >= 1 && port <= 65535 )) || continue
-    [[ "$w" =~ ^[0-9]+$ ]] || w="1"
-    (( w < 1 )) && w=1
-    (( w > 100 )) && w=100
-
-    PORTS_OUT+=("$port")
-    WEIGHTS_OUT+=("$w")
-  done
-}
-
 write_gost_ports() {
   local -a backends=("$@")
+  local ports_csv="$PORTS_CSV"
+  IFS=',' read -r -a ports <<< "$ports_csv"
+  unset IFS
+
   (( ${#backends[@]} > 0 )) || return 1
 
-  local -a ports weights
-  parse_ports_csv "$PORTS_CSV" ports weights
-  (( ${#ports[@]} > 0 )) || return 1
-
-  # Weighted greedy assignment: assign each port to the backend with the lowest current load.
-  # Load = sum(weights). Default weight=1; e.g. 8801:3 counts like 3 ports.
+  # round-robin distribution
   declare -A ip2ports=()
-  declare -A ip2load=()
+  local idx=0
+  local p tid ip
+  for p in "${ports[@]}"; do
+    p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
 
-  local tid ip i best_ip best_load cur_load w p
-  for tid in "${backends[@]}"; do
+    tid="${backends[$(( idx % ${#backends[@]} ))]}"
     ip="${TID2PEER[$tid]:-}"
-    [[ -n "$ip" ]] || continue
-    ip2load["$ip"]=0
-    ip2ports["$ip"]=""
-  done
+    [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
 
-  for i in "${!ports[@]}"; do
-    p="${ports[$i]}"
-    w="${weights[$i]}"
-
-    best_ip=""
-    best_load=0
-
-    for tid in "${backends[@]}"; do
-      ip="${TID2PEER[$tid]:-}"
-      [[ -n "$ip" ]] || continue
-      cur_load="${ip2load[$ip]:-0}"
-      if [[ -z "$best_ip" || "$cur_load" -lt "$best_load" ]]; then
-        best_ip="$ip"
-        best_load="$cur_load"
-      fi
-    done
-
-    [[ -n "$best_ip" ]] || continue
-    if [[ -z "${ip2ports[$best_ip]:-}" ]]; then
-      ip2ports["$best_ip"]="$p"
+    if [[ -z "${ip2ports[$ip]:-}" ]]; then
+      ip2ports["$ip"]="$p"
     else
-      ip2ports["$best_ip"]+=",${p}"
+      ip2ports["$ip"]+=",${p}"
     fi
-    ip2load["$best_ip"]=$(( ${ip2load[$best_ip]:-0} + w ))
+    idx=$((idx+1))
   done
 
+  # stable ordering by tid numeric
   local tmp; tmp="$(mktemp)"
   for tid in "${backends[@]}"; do
     ip="${TID2PEER[$tid]:-}"
@@ -308,7 +253,6 @@ write_gost_ports() {
   rm -f "$tmp"
   return 0
 }
-
 
 # Build gost args file exactly like your snippet
 rebuild_gost_args_and_restart() {
@@ -541,46 +485,79 @@ main() {
   local tmp_args;  tmp_args="$(mktemp)"
   trap 'rm -f "$tmp_ports" "$tmp_args"' EXIT
 
-  # Write temp gost_ports (weighted greedy assignment)
+  # Write temp gost_ports
   {
-    local -a ports weights
-    parse_ports_csv "$PORTS_CSV" ports weights
+    # Ports can have optional weights: e.g. 8801:2 means weight=2, default weight=1.
+    # We assign ports to selected backends using a greedy "least-load" algorithm
+    # (ports with higher weight consume more capacity on a backend).
+    local ports_csv="$PORTS_CSV"
+    IFS=',' read -r -a raw_ports <<< "$ports_csv"
+    unset IFS
 
+    local -a b_tids=("${chosen[@]}")
+    local bcount="${#b_tids[@]}"
+    (( bcount > 0 )) || exit 0
+
+    declare -A load=()
     declare -A ip2ports=()
-    declare -A ip2load=()
+    local i
+    for ((i=0; i<bcount; i++)); do load["$i"]=0; done
 
-    local tid ip i best_ip best_load cur_load w p
-    for tid in "${chosen[@]}"; do
-      ip="${TID2PEER[$tid]:-}"
-      [[ -n "$ip" ]] || continue
-      ip2load["$ip"]=0
-      ip2ports["$ip"]=""
+    local -a ports=()
+    local -a weights=()
+    local item p w
+    for item in "${raw_ports[@]}"; do
+      item="$(printf '%s' "$item" | tr -d '[:space:]')"
+      [[ -n "$item" ]] || continue
+      if [[ "$item" == *:* ]]; then
+        p="${item%%:*}"
+        w="${item#*:}"
+      else
+        p="$item"
+        w="1"
+      fi
+      [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+      (( p >= 1 && p <= 65535 )) || continue
+      [[ "$w" =~ ^[0-9]+$ ]] || w="1"
+      (( w >= 1 )) || w="1"
+      ports+=("$p")
+      weights+=("$w")
     done
 
-    for i in "${!ports[@]}"; do
-      p="${ports[$i]}"
-      w="${weights[$i]}"
+    # sort by weight desc (n is small)
+    local n="${#ports[@]}"
+    local a b tmp
+    for ((a=0; a<n; a++)); do
+      for ((b=a+1; b<n; b++)); do
+        if (( weights[b] > weights[a] )); then
+          tmp="${weights[a]}"; weights[a]="${weights[b]}"; weights[b]="$tmp"
+          tmp="${ports[a]}"; ports[a]="${ports[b]}"; ports[b]="$tmp"
+        fi
+      done
+    done
 
-      best_ip=""
-      best_load=0
-
-      for tid in "${chosen[@]}"; do
-        ip="${TID2PEER[$tid]:-}"
-        [[ -n "$ip" ]] || continue
-        cur_load="${ip2load[$ip]:-0}"
-        if [[ -z "$best_ip" || "$cur_load" -lt "$best_load" ]]; then
-          best_ip="$ip"
-          best_load="$cur_load"
+    local idx best best_load tid ip
+    for ((i=0; i<n; i++)); do
+      best=0
+      best_load="${load[0]}"
+      for ((idx=1; idx<bcount; idx++)); do
+        if (( load[idx] < best_load )); then
+          best="$idx"
+          best_load="${load[idx]}"
         fi
       done
 
-      [[ -n "$best_ip" ]] || continue
-      if [[ -z "${ip2ports[$best_ip]:-}" ]]; then
-        ip2ports["$best_ip"]="$p"
+      tid="${b_tids[$best]}"
+      ip="${TID2PEER[$tid]:-}"
+      [[ -n "$ip" ]] || continue
+
+      if [[ -z "${ip2ports[$ip]:-}" ]]; then
+        ip2ports["$ip"]="${ports[i]}"
       else
-        ip2ports["$best_ip"]+=",${p}"
+        ip2ports["$ip"]+=",${ports[i]}"
       fi
-      ip2load["$best_ip"]=$(( ${ip2load[$best_ip]:-0} + w ))
+
+      load["$best"]=$(( load["$best"] + weights[i] ))
     done
 
     for tid in "${chosen[@]}"; do
