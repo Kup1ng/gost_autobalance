@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Repo: https://github.com/Kup1ng/gost_autobalance
 REPO_RAW_BASE="https://raw.githubusercontent.com/Kup1ng/gost_autobalance/main"
 
 CONF="/etc/gost_autobalance.conf"
-BIN="/usr/local/bin/gost-autobalance"
+BIN="/usr/local/bin/gost-autobalance.sh"
 STATE_DIR="/var/lib/gost-autobalance"
 
 SERVICE="/etc/systemd/system/gost-autobalance.service"
 TIMER="/etc/systemd/system/gost-autobalance.timer"
+LOCK="/run/gost-autobalance.lock"
 
 GOST_PORTS_FILE="/etc/gost_ports.txt"
 GOST_ARGS_FILE="/etc/gost_args.conf"
@@ -30,8 +32,9 @@ fetch() {
 
 backup_files() {
   mkdir -p "$STATE_DIR/backup"
-  local ts; ts="$(date +%Y%m%d-%H%M%S)"
-  local dir="$STATE_DIR/backup/$ts"
+  local ts dir
+  ts="$(date +%Y%m%d-%H%M%S)"
+  dir="$STATE_DIR/backup/$ts"
   mkdir -p "$dir"
   [[ -f "$GOST_PORTS_FILE" ]] && cp -a "$GOST_PORTS_FILE" "$dir/gost_ports.txt"
   [[ -f "$GOST_ARGS_FILE"  ]] && cp -a "$GOST_ARGS_FILE"  "$dir/gost_args.conf"
@@ -41,7 +44,8 @@ backup_files() {
 
 restore_latest_backup() {
   [[ -f "$STATE_DIR/backup/LATEST" ]] || return 0
-  local dir; dir="$(cat "$STATE_DIR/backup/LATEST" 2>/dev/null || true)"
+  local dir
+  dir="$(cat "$STATE_DIR/backup/LATEST" 2>/dev/null || true)"
   [[ -d "$dir" ]] || return 0
   [[ -f "$dir/gost_ports.txt" ]] && cp -a "$dir/gost_ports.txt" "$GOST_PORTS_FILE"
   [[ -f "$dir/gost_args.conf" ]]  && cp -a "$dir/gost_args.conf"  "$GOST_ARGS_FILE"
@@ -56,6 +60,7 @@ install_flow() {
   need_cmd sed
   need_cmd tr
   need_cmd grep
+  need_cmd flock
 
   echo "=== gost-autobalance :: INSTALL ==="
 
@@ -73,7 +78,7 @@ install_flow() {
   read -rp "How many GRE backends to use concurrently? (default 4): " WANT_N
   WANT_N="${WANT_N:-4}"
   [[ "$WANT_N" =~ ^[0-9]+$ ]] || { echo "Invalid number"; exit 1; }
-  (( WANT_N >= 1 && WANT_N <= 64 )) || { echo "Unreasonable number"; exit 1; }
+  (( WANT_N >= 1 && WANT_N <= 256 )) || { echo "Unreasonable number"; exit 1; }
 
   read -rp "Loss threshold percent (default 20): " LOSS_THRESH
   LOSS_THRESH="${LOSS_THRESH:-20}"
@@ -88,10 +93,33 @@ install_flow() {
   GOOD_FOR="${GOOD_FOR:-30}"
   [[ "$GOOD_FOR" =~ ^[0-9]+$ ]] || { echo "Invalid GOOD_FOR"; exit 1; }
 
+  # Per your request: run every minute by default
   read -rp "Check interval seconds (default 60): " INTERVAL
   INTERVAL="${INTERVAL:-60}"
   [[ "$INTERVAL" =~ ^[0-9]+$ ]] || { echo "Invalid INTERVAL"; exit 1; }
   (( INTERVAL >= 5 && INTERVAL <= 3600 )) || { echo "Invalid interval"; exit 1; }
+
+  # Parallel checks settings
+  read -rp "Max parallel GRE checks (default 8): " MAX_PARALLEL
+  MAX_PARALLEL="${MAX_PARALLEL:-8}"
+  [[ "$MAX_PARALLEL" =~ ^[0-9]+$ ]] || { echo "Invalid MAX_PARALLEL"; exit 1; }
+  (( MAX_PARALLEL >= 1 && MAX_PARALLEL <= 128 )) || { echo "Invalid MAX_PARALLEL"; exit 1; }
+
+  read -rp "Ping count per GRE check (default 20): " PING_COUNT
+  PING_COUNT="${PING_COUNT:-20}"
+  [[ "$PING_COUNT" =~ ^[0-9]+$ ]] || { echo "Invalid PING_COUNT"; exit 1; }
+
+  read -rp "Ping interval seconds (default 0.2): " PING_INTERVAL
+  PING_INTERVAL="${PING_INTERVAL:-0.2}"
+  [[ "$PING_INTERVAL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid PING_INTERVAL"; exit 1; }
+
+  read -rp "Ping per-packet timeout seconds (-W) (default 1): " PING_TIMEOUT
+  PING_TIMEOUT="${PING_TIMEOUT:-1}"
+  [[ "$PING_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "Invalid PING_TIMEOUT"; exit 1; }
+
+  read -rp "Ping total deadline seconds (-w) (default 6): " PING_DEADLINE
+  PING_DEADLINE="${PING_DEADLINE:-6}"
+  [[ "$PING_DEADLINE" =~ ^[0-9]+$ ]] || { echo "Invalid PING_DEADLINE"; exit 1; }
 
   read -rp "Gost systemd service name (default: ${GOST_SERVICE_DEFAULT}): " GOST_SERVICE
   GOST_SERVICE="${GOST_SERVICE:-$GOST_SERVICE_DEFAULT}"
@@ -100,7 +128,7 @@ install_flow() {
   backup_files
 
   tmp="$(mktemp)"
-  fetch "${REPO_RAW_BASE}/gost-autobalance" "$tmp"
+  fetch "${REPO_RAW_BASE}/gost-autobalance.sh" "$tmp"
   install -m 0755 "$tmp" "$BIN"
   rm -f "$tmp"
 
@@ -112,6 +140,13 @@ LOSS_THRESH=$LOSS_THRESH
 BAD_FOR=$BAD_FOR
 GOOD_FOR=$GOOD_FOR
 INTERVAL=$INTERVAL
+
+# Parallelism + ping tuning
+MAX_PARALLEL=$MAX_PARALLEL
+PING_COUNT=$PING_COUNT
+PING_INTERVAL=$PING_INTERVAL
+PING_TIMEOUT=$PING_TIMEOUT
+PING_DEADLINE=$PING_DEADLINE
 
 # Output files used by your gost service
 GOST_PORTS_FILE="$GOST_PORTS_FILE"
@@ -127,7 +162,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$BIN
+# Prevent overlapping runs if a previous check takes too long
+ExecStart=/usr/bin/flock -n $LOCK $BIN
 EOF
 
   cat > "$TIMER" <<EOF
@@ -169,6 +205,7 @@ remove_flow() {
 
   rm -f "$CONF" "$BIN"
   rm -rf "$STATE_DIR"
+  rm -f "$LOCK"
 
   echo "[OK] Removed. (Restored backups if available.)"
 }
