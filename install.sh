@@ -66,6 +66,7 @@ install_flow() {
   need_cmd flock
 
   echo "=== gost-autobalance :: INSTALL ==="
+  echo "NOTE: This installer NEVER installs/removes the gost binary (/usr/local/bin/gost)."
 
   read -rp "Ports CSV (supports weights, e.g. 8001:3,8081:2,8002): " PORTS
   PORTS="$(printf '%s' "$PORTS" | tr -d '[:space:]')"
@@ -210,6 +211,7 @@ EOF
 remove_flow() {
   need_root
   echo "=== gost-autobalance :: REMOVE ==="
+  echo "NOTE: gost binary (/usr/local/bin/gost) is NOT touched."
 
   systemctl stop gost-autobalance.timer 2>/dev/null || true
   systemctl disable gost-autobalance.timer 2>/dev/null || true
