@@ -326,7 +326,7 @@ status_ping_all() {
         exit 0
       fi
 
-      link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\\/gre/ {print; exit}' || true)
+      link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | grep -m1 "link/gre" || true)
       local_pub=$(echo "$link_line" | awk '{print $2}')
       peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
 
