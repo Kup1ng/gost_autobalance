@@ -29,8 +29,9 @@ ping_loss_pct_fast() {
   local dst_ip="$2"
   local out loss
 
-  # faster than your GRE script; enough for decision-making
-  out=$(/bin/ping -c 20 -i 0.2 -W 1 -w 6 -I "$src_ip" "$dst_ip" 2>&1 || true)
+  # Configurable ping parameters from /etc/gost_autobalance.conf
+  # Defaults match the original behavior unless overridden.
+  out=$(/bin/ping -c "${PING_COUNT:-20}" -i "${PING_INTERVAL:-0.2}" -W "${PING_TIMEOUT:-1}" -w "${PING_DEADLINE:-6}" -I "$src_ip" "$dst_ip" 2>&1 || true)
   loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | head -n1 | cut -d% -f1 || true)
   if [[ -z "${loss:-}" ]]; then
     echo "100"; return 0
@@ -268,23 +269,49 @@ main() {
 
   # Evaluate each tunnel quickly (loss test), update state with step=INTERVAL
   # (we approximate streak seconds by interval; good enough)
-  local loss local_ip peer_ip is_good
-  for tid in "${tids[@]}"; do
-    local_ip="${TID2LOCAL[$tid]:-}"
-    peer_ip="${TID2PEER[$tid]:-}"
-    if [[ -z "$local_ip" || -z "$peer_ip" ]]; then
-      update_state_for_result "$tid" 0 "$INTERVAL"
-      continue
-    fi
+  # Evaluate each tunnel quickly (loss test) in parallel, then update state.
+  # This prevents long runtimes when you have many GRE interfaces.
+  local tmp_results
+  tmp_results="$(mktemp)"
+  local MAXP
+  MAXP="${MAX_PARALLEL:-8}"
 
-    loss="$(ping_loss_pct_fast "$local_ip" "$peer_ip")"
+  # Run parallel ping checks with a concurrency limit
+  local active=0
+  local loss local_ip peer_ip
+  for tid in "${tids[@]}"; do
+    (
+      local_ip="${TID2LOCAL[$tid]:-}"
+      peer_ip="${TID2PEER[$tid]:-}"
+      if [[ -z "$local_ip" || -z "$peer_ip" ]]; then
+        echo "$tid 100" >> "$tmp_results"
+        exit 0
+      fi
+      loss="$(ping_loss_pct_fast "$local_ip" "$peer_ip")"
+      echo "$tid $loss" >> "$tmp_results"
+    ) &
+
+    active=$((active + 1))
+    if (( active >= MAXP )); then
+      wait -n || true
+      active=$((active - 1))
+    fi
+  done
+  wait || true
+
+  # Apply results (state updates are done sequentially to avoid state file races)
+  local is_good
+  while read -r tid loss; do
+    [[ "$tid" =~ ^[0-9]+$ ]] || continue
+    [[ "$loss" =~ ^[0-9]+$ ]] || loss=100
     if (( loss <= LOSS_THRESH )); then
       is_good=1
     else
       is_good=0
     fi
     update_state_for_result "$tid" "$is_good" "$INTERVAL"
-  done
+  done < "$tmp_results"
+  rm -f "$tmp_results"
 
   # Pick best backends
   mapfile -t chosen < <(select_backends "${tids[@]}" || true)
