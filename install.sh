@@ -67,25 +67,20 @@ install_flow() {
 
   echo "=== gost-autobalance :: INSTALL ==="
 
-  read -rp "Ports CSV (example: 8001,8007,8002,...): " PORTS
+  read -rp "Ports CSV (supports weights, e.g. 8001:3,8081:2,8002): " PORTS
   PORTS="$(printf '%s' "$PORTS" | tr -d '[:space:]')"
   [[ -n "$PORTS" ]] || { echo "Ports cannot be empty"; exit 1; }
 
   IFS=',' read -r -a _ports_arr <<< "$PORTS"
-  for item in "${_ports_arr[@]}"; do
-    item="$(printf '%s' "$item" | tr -d '[:space:]')"
-    [[ -n "$item" ]] || continue
-    if [[ "$item" == *:* ]]; then
-      p="${item%%:*}"
-      w="${item#*:}"
-    else
-      p="$item"
-      w="1"
+  for p in "${_ports_arr[@]}"; do
+    [[ "$p" =~ ^[0-9]{1,5}(:[0-9]{1,3})?$ ]] || { echo "Invalid port item: $p (use 8081 or 8081:2)"; exit 1; }
+    port_num="${p%%:*}"
+    (( port_num >= 1 && port_num <= 65535 )) || { echo "Invalid port range: $p"; exit 1; }
+    if [[ "$p" == *:* ]]; then
+      w="${p##*:}"
+      [[ "$w" =~ ^[0-9]+$ ]] || { echo "Invalid weight for $p"; exit 1; }
+      (( w >= 1 && w <= 100 )) || { echo "Invalid weight for $p (1-100)"; exit 1; }
     fi
-    [[ "$p" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid port: $item"; exit 1; }
-    (( p >= 1 && p <= 65535 )) || { echo "Invalid port range: $p"; exit 1; }
-    [[ "$w" =~ ^[0-9]+$ ]] || { echo "Invalid weight for $p: $w"; exit 1; }
-    (( w >= 1 && w <= 1000 )) || { echo "Invalid weight for $p: $w"; exit 1; }
   done
   unset IFS
 
@@ -146,6 +141,14 @@ install_flow() {
   install -m 0755 "$tmp" "$BIN"
   rm -f "$tmp"
 
+  # Convenience command (no conflict with gost binary): `gostlb` shows status + port map
+  cat > /usr/local/bin/gostlb <<'EOS'
+#!/usr/bin/env bash
+exec /usr/local/bin/gost-autobalance.sh status
+EOS
+  chmod +x /usr/local/bin/gostlb
+  hash -r || true
+
   cat > "$CONF" <<EOF
 # gost-autobalance config
 PORTS_CSV="$PORTS"
@@ -196,15 +199,6 @@ EOF
   systemctl daemon-reload
   systemctl enable --now gost-autobalance.timer
 
-  # Convenience command (no conflict with gost binary): gostlb
-  cat > /usr/local/bin/gostlb <<'EOS'
-#!/usr/bin/env bash
-exec /usr/local/bin/gost-autobalance.sh status
-EOS
-  chmod +x /usr/local/bin/gostlb
-  hash -r || true
-
-
   echo
   echo "[OK] Installed."
   echo "Config: $CONF"
@@ -226,7 +220,7 @@ remove_flow() {
 
   restore_latest_backup
 
-  rm -f "$CONF" "$BIN"
+  rm -f "$CONF" "$BIN" /usr/local/bin/gostlb
   rm -rf "$STATE_DIR"
   rm -f "$LOCK"
 
