@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Colors (for status output)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Status ping defaults (can be overridden in /etc/gost_autobalance.conf)
+STATUS_PING_COUNT=${STATUS_PING_COUNT:-20}
+STATUS_PING_INTERVAL=${STATUS_PING_INTERVAL:-0.1}
+STATUS_PING_TIMEOUT=${STATUS_PING_TIMEOUT:-1}
+STATUS_PING_DEADLINE=${STATUS_PING_DEADLINE:-6}
+
 CONF="/etc/gost_autobalance.conf"
 [[ -f "$CONF" ]] || { echo "Missing $CONF"; exit 1; }
 # shellcheck disable=SC1090
@@ -24,6 +36,28 @@ calc_peer_ip() {
 }
 
 # Fast loss check (integer 0-100). Unknown => 100
+ping_loss_pct() {
+  # Usage: ping_loss_pct <src_ip_or_dash> <dst_ip>
+  # If src is "-", ping without binding; otherwise bind using -I <src>.
+  local src="$1"
+  local dst="$2"
+  local out loss
+  if [[ "$src" == "-" ]]; then
+    out=$(/bin/ping -c "${STATUS_PING_COUNT}" -i "${STATUS_PING_INTERVAL}" -W "${STATUS_PING_TIMEOUT}" -w "${STATUS_PING_DEADLINE}" "$dst" 2>&1 || true)
+  else
+    out=$(/bin/ping -c "${STATUS_PING_COUNT}" -i "${STATUS_PING_INTERVAL}" -W "${STATUS_PING_TIMEOUT}" -w "${STATUS_PING_DEADLINE}" -I "$src" "$dst" 2>&1 || true)
+  fi
+  loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | head -n1 | cut -d% -f1 || true)
+  if [[ -z "${loss:-}" ]]; then
+    echo "100"; return 0
+  fi
+  loss="${loss%%.*}"
+  [[ "$loss" =~ ^[0-9]+$ ]] || { echo "100"; return 0; }
+  (( loss < 0 )) && loss=0
+  (( loss > 100 )) && loss=100
+  echo "$loss"
+}
+
 ping_loss_pct_fast() {
   local src_ip="$1"
   local dst_ip="$2"
@@ -249,6 +283,131 @@ files_equal() {
   cmp -s "$a" "$b"
 }
 
+status_ping_all() {
+  shopt -s nullglob
+
+  local ifaces=()
+  local sline
+  while read -r sline; do
+    [[ -n "$sline" ]] || continue
+    sline="${sline%%@*}"
+    ifaces+=("$sline")
+  done < <(
+    /sbin/ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^gre-(ir|kh)-[0-9]+' | sort -u
+  )
+
+  if (( ${#ifaces[@]} == 0 )); then
+    echo "No GRE interfaces found."
+    return 0
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir:-}"' RETURN
+
+  for ifc in "${ifaces[@]}"; do
+    (
+      local tid local_tun_ip dst_ip link_line local_pub peer_pub
+      local peer_loss dst_loss detail max_loss
+      local peer_file dst_file row_file
+
+      tid=$(echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/')
+      [[ -n "$tid" ]] || tid="$ifc"
+
+      local_tun_ip=$(/sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+      if [[ -z "$local_tun_ip" ]]; then
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/row_${tid}"
+        exit 0
+      fi
+
+      dst_ip=$(calc_peer_ip "$local_tun_ip")
+      if [[ -z "$dst_ip" ]]; then
+        echo -e "${tid}\t-\t(100%)\t-\t(100%)\t${RED}DC${NC}" > "$tmpdir/row_${tid}"
+        exit 0
+      fi
+
+      link_line=$(/sbin/ip -d link show "$ifc" 2>/dev/null | awk '/link\\/gre/ {print; exit}' || true)
+      local_pub=$(echo "$link_line" | awk '{print $2}')
+      peer_pub=$(echo "$link_line" | awk '{for (i=1;i<=NF;i++) if ($i=="peer") {print $(i+1); exit}}')
+
+      peer_file="$tmpdir/.peer_${tid}"
+      dst_file="$tmpdir/.dst_${tid}"
+      row_file="$tmpdir/row_${tid}"
+
+      if [[ -n "${local_pub:-}" && -n "${peer_pub:-}" ]]; then
+        ping_loss_pct "-" "$peer_pub" > "$peer_file" &
+      else
+        peer_pub="-"
+        echo "100" > "$peer_file" &
+      fi
+
+      ping_loss_pct "$local_tun_ip" "$dst_ip" > "$dst_file" &
+      wait
+
+      peer_loss=$(cat "$peer_file" 2>/dev/null || echo "100")
+      dst_loss=$(cat "$dst_file" 2>/dev/null || echo "100")
+
+      if (( peer_loss >= 100 || dst_loss >= 100 )); then
+        detail="${RED}DC${NC}"
+      else
+        if (( peer_loss > LOSS_THRESH || dst_loss > LOSS_THRESH )); then
+          max_loss=$peer_loss
+          (( dst_loss > max_loss )) && max_loss=$dst_loss
+          detail="${YELLOW}Warning (${max_loss}%)${NC}"
+        else
+          detail="${GREEN}Connected${NC}"
+        fi
+      fi
+
+      echo -e "${tid}\t${peer_pub}\t(${peer_loss}%)\t${dst_ip}\t(${dst_loss}%)\t${detail}" > "$row_file"
+    ) &
+  done
+
+  wait
+
+  {
+    for f in "$tmpdir"/row_*; do
+      [[ -f "$f" ]] || continue
+      cat "$f"
+    done
+  } | sort -t$'\t' -k1,1n | awk -F'\t' 'BEGIN{
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n","IFACE","PEER_IP","STAT","DST_IP","STAT","DETAIL"
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n","-----","---------------","-----","---------------","-----","-------------------------"
+    }{
+      printf "%-6s %-16s %-7s %-16s %-7s %s\n",$1,$2,$3,$4,$5,$6
+    }'
+}
+
+gost_port_map() {
+  if [[ ! -f "$GOST_PORTS_FILE" ]]; then
+    echo "No $GOST_PORTS_FILE found."
+    return 0
+  fi
+
+  echo
+  echo "PORT   -> BACKEND_IP"
+  echo "-----     ----------------"
+  while IFS= read -r rawline; do
+    line="$(printf '%s' "$rawline" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+    case "$line" in \#*) continue ;; esac
+    ip="${line%%:*}"
+    ports_csv="${line#*:}"
+    IFS=',' read -r -a ports <<< "$ports_csv"
+    for p in "${ports[@]}"; do
+      p="$(printf '%s' "$p" | tr -d '[:space:]')"
+      [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+      printf "%-7s %-16s\n" "$p" "$ip"
+    done
+    unset IFS
+  done < "$GOST_PORTS_FILE" | sort -n
+}
+
+show_status() {
+  status_ping_all
+  gost_port_map
+}
+
 main() {
   refresh_tunnel_map
 
@@ -381,4 +540,16 @@ main() {
   echo "[gost-autobalance] Updated mapping using GRE: ${chosen[*]}"
 }
 
-main
+cmd="${1:-apply}"
+case "$cmd" in
+  status|"")
+    show_status
+    ;;
+  apply)
+    main
+    ;;
+  *)
+    echo "Usage: $(basename "$0") [apply|status]"
+    exit 1
+    ;;
+esac
