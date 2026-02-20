@@ -23,10 +23,8 @@ fetch() {
   local url="$1" out="$2"
   echo "[*] Downloading: $url"
   if command -v wget >/dev/null 2>&1; then
-    # -4: force IPv4 (avoids IPv6 issues), --timeout: per-try timeout, --tries: retries
     wget -4 -q --timeout=15 --tries=3 -O "$out" "$url"
   elif command -v curl >/dev/null 2>&1; then
-    # -4: force IPv4, --connect-timeout / --max-time: avoid hanging
     curl -4 -fsSL --connect-timeout 10 --max-time 25 "$url" -o "$out"
   else
     echo "Need wget or curl"; exit 1
@@ -67,14 +65,25 @@ install_flow() {
 
   echo "=== gost-autobalance :: INSTALL ==="
 
-  read -rp "Ports CSV (example: 8001,8007,8002,...): " PORTS
+  read -rp "Ports CSV (example: 8001,8007,8002 or weighted 8001:3,8081:2,...): " PORTS
   PORTS="$(printf '%s' "$PORTS" | tr -d '[:space:]')"
   [[ -n "$PORTS" ]] || { echo "Ports cannot be empty"; exit 1; }
 
-  IFS=',' read -r -a _ports_arr <<< "$PORTS"
-  for p in "${_ports_arr[@]}"; do
-    [[ "$p" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid port: $p"; exit 1; }
-    (( p >= 1 && p <= 65535 )) || { echo "Invalid port range: $p"; exit 1; }
+    IFS=',' read -r -a _ports_arr <<< "$PORTS"
+  for item in "${_ports_arr[@]}"; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [[ -n "$item" ]] || continue
+
+    port="${item%%:*}"
+    w="${item#*:}"
+    if [[ "$item" == "$port" ]]; then
+      w="1"
+    fi
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid port spec: $item"; exit 1; }
+    (( port >= 1 && port <= 65535 )) || { echo "Invalid port range: $item"; exit 1; }
+    [[ "$w" =~ ^[0-9]+$ ]] || { echo "Invalid weight in: $item"; exit 1; }
+    (( w >= 1 && w <= 100 )) || { echo "Weight must be 1..100 in: $item"; exit 1; }
   done
   unset IFS
 
@@ -135,6 +144,14 @@ install_flow() {
   install -m 0755 "$tmp" "$BIN"
   rm -f "$tmp"
 
+  # Convenience command (no conflict with gost binary): `gostlb` shows status + port map
+  cat > /usr/local/bin/gostlb <<'EOS'
+#!/usr/bin/env bash
+exec /usr/local/bin/gost-autobalance.sh status
+EOS
+  chmod +x /usr/local/bin/gostlb
+  hash -r || true
+
   cat > "$CONF" <<EOF
 # gost-autobalance config
 PORTS_CSV="$PORTS"
@@ -189,6 +206,7 @@ EOF
   echo "[OK] Installed."
   echo "Config: $CONF"
   echo "Run once: $BIN"
+  echo "Status cmd: gostlb"
   echo "Timer: systemctl status gost-autobalance.timer --no-pager"
   echo "Logs : journalctl -u gost-autobalance.service -n 200 --no-pager"
 }
@@ -206,7 +224,7 @@ remove_flow() {
 
   restore_latest_backup
 
-  rm -f "$CONF" "$BIN"
+  rm -f "$CONF" "$BIN" /usr/local/bin/gostlb /usr/local/bin/gost
   rm -rf "$STATE_DIR"
   rm -f "$LOCK"
 
