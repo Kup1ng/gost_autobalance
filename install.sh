@@ -21,10 +21,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1"; ex
 
 fetch() {
   local url="$1" out="$2"
+  echo "[*] Downloading: $url"
   if command -v wget >/dev/null 2>&1; then
-    wget -qO "$out" "$url"
+    # -4: force IPv4 (avoids IPv6 issues), --timeout: per-try timeout, --tries: retries
+    wget -4 -q --timeout=15 --tries=3 -O "$out" "$url"
   elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$out"
+    # -4: force IPv4, --connect-timeout / --max-time: avoid hanging
+    curl -4 -fsSL --connect-timeout 10 --max-time 25 "$url" -o "$out"
   else
     echo "Need wget or curl"; exit 1
   fi
