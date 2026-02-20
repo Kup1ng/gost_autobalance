@@ -21,11 +21,11 @@ source "$CONF"
 STATE_DIR="/var/lib/gost-autobalance"
 mkdir -p "$STATE_DIR"
 
-parse_ports_weighted() {
+parse_ports_with_weights() {
   # Input: PORTS_CSV entries like "8081:2,8001:3,9000"
-  # Output: prints expanded ports one per line, where weight repeats the port.
+  # Output: one line per PORT with its WEIGHT: "<port> <weight>"
   local csv="$1"
-  local item port w i
+  local item port w
   IFS=',' read -r -a items <<< "$csv"
   unset IFS
 
@@ -40,12 +40,11 @@ parse_ports_weighted() {
       [[ "$w" =~ ^[0-9]+$ ]] || w=1
       (( w < 1 )) && w=1
       (( w > 100 )) && w=100
-      for ((i=0; i<w; i++)); do
-        echo "$port"
-      done
+      echo "$port $w"
     fi
   done
 }
+
 
 now_epoch() { date +%s; }
 
@@ -233,52 +232,108 @@ refresh_tunnel_map() {
 }
 
 # Generate /etc/gost_ports.txt based on selected tids + ports distribution
-write_gost_ports() {
+distribute_ports_weighted_unique() {
+  # Args:
+  #   1: csv ports (with optional :weight)
+  #   remaining: backend tids (already ordered by priority, lowest first)
+  # Output:
+  #   prints lines "DST_IP:port1,port2,..." in backend order.
+  local ports_csv="$1"; shift
   local -a backends=("$@")
-  local ports_csv="$PORTS_CSV"
-  local -a ports=()
-  mapfile -t ports < <(parse_ports_weighted "$ports_csv")
-
   (( ${#backends[@]} > 0 )) || return 1
 
-  # round-robin distribution
-  declare -A ip2ports=()
-  local idx=0
-  local p tid ip
-  for p in "${ports[@]}"; do
-    p="$(printf '%s' "$p" | tr -d '[:space:]')"
-    [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+  # Read ports with weights
+  local -a pw_lines=()
+  mapfile -t pw_lines < <(parse_ports_with_weights "$ports_csv")
 
-    tid="${backends[$(( idx % ${#backends[@]} ))]}"
-    ip="${TID2PEER[$tid]:-}"
-    [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
-
-    if [[ -z "${ip2ports[$ip]:-}" ]]; then
-      ip2ports["$ip"]="$p"
-    else
-      ip2ports["$ip"]+=",${p}"
-    fi
-    idx=$((idx+1))
+  # Build sortable lines: "weight<TAB>port"
+  local tmp_sort
+  tmp_sort="$(mktemp)"
+  for ln in "${pw_lines[@]}"; do
+    port="${ln%% *}"
+    w="${ln##* }"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+    [[ "$w" =~ ^[0-9]+$ ]] || w=1
+    echo -e "${w}	${port}" >> "$tmp_sort"
   done
 
-  # stable ordering by tid numeric
-  local tmp; tmp="$(mktemp)"
-  for tid in "${backends[@]}"; do
+  # Sort: weight desc, port asc
+  local -a sorted=()
+  mapfile -t sorted < <(sort -t$'\t' -k1,1nr -k2,2n "$tmp_sort" 2>/dev/null || cat "$tmp_sort")
+  rm -f "$tmp_sort"
+
+  # Loads per backend (sum of weights)
+  local -a load=()
+  local i
+  for ((i=0;i<${#backends[@]};i++)); do load[i]=0; done
+
+  # ip2ports mapping and backend->ip mapping
+  declare -A ip2ports=()
+  declare -A idx2ip=()
+  local tid ip
+  for ((i=0;i<${#backends[@]};i++)); do
+    tid="${backends[$i]}"
     ip="${TID2PEER[$tid]:-}"
     [[ -n "$ip" ]] || continue
-    [[ -n "${ip2ports[$ip]:-}" ]] || continue
-    echo "${ip}:${ip2ports[$ip]}" >> "$tmp"
+    idx2ip["$i"]="$ip"
   done
 
-  if [[ ! -s "$tmp" ]]; then
+  # Assign each port ONCE to the least-loaded backend (ties -> lower backend index)
+  local line w port best best_load
+  for line in "${sorted[@]}"; do
+    w="${line%%$'\t'*}"
+    port="${line##*$'\t'}"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+    [[ "$w" =~ ^[0-9]+$ ]] || w=1
+
+    best=0
+    best_load="${load[0]}"
+    for ((i=1;i<${#backends[@]};i++)); do
+      if (( load[i] < best_load )); then
+        best="$i"
+        best_load="${load[i]}"
+      fi
+    done
+
+    ip="${idx2ip[$best]:-}"
+    [[ -n "$ip" ]] || continue
+
+    if [[ -z "${ip2ports[$ip]:-}" ]]; then
+      ip2ports["$ip"]="$port"
+    else
+      ip2ports["$ip"]+=",${port}"
+    fi
+    load[$best]=$(( load[$best] + w ))
+  done
+
+  # Emit in backend order (stable)
+  local out_any=0
+  for ((i=0;i<${#backends[@]};i++)); do
+    ip="${idx2ip[$i]:-}"
+    [[ -n "$ip" ]] || continue
+    [[ -n "${ip2ports[$ip]:-}" ]] || continue
+    echo "${ip}:${ip2ports[$ip]}"
+    out_any=1
+  done
+
+  (( out_any == 1 )) || return 1
+  return 0
+}
+
+write_gost_ports() {
+  local -a backends=("$@")
+  (( ${#backends[@]} > 0 )) || return 1
+
+  local tmp; tmp="$(mktemp)"
+  if ! distribute_ports_weighted_unique "$PORTS_CSV" "${backends[@]}" > "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
-
   install -m 0644 "$tmp" "$GOST_PORTS_FILE"
   rm -f "$tmp"
   return 0
 }
+
 
 # Build gost args file exactly like your snippet (safe + atomic)
 rebuild_gost_args_and_restart() {
@@ -588,41 +643,11 @@ main() {
   local tmp_args;  tmp_args="$(mktemp)"
   trap 'rm -f "$tmp_ports" "$tmp_args"' EXIT
 
-  # Write temp gost_ports
-  {
-    # Generate in memory similar to write_gost_ports but to tmp
-    local ports_csv="$PORTS_CSV"
-    local -a ports=()
-    mapfile -t ports < <(parse_ports_weighted "$ports_csv")
-
-    declare -A ip2ports=()
-    local idx=0
-    local p tid ip
-    for p in "${ports[@]}"; do
-      p="$(printf '%s' "$p" | tr -d '[:space:]')"
-      [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
-
-      tid="${chosen[$(( idx % ${#chosen[@]} ))]}"
-      ip="${TID2PEER[$tid]:-}"
-      [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
-
-      if [[ -z "${ip2ports[$ip]:-}" ]]; then
-        ip2ports["$ip"]="$p"
-      else
-        ip2ports["$ip"]+=",${p}"
-      fi
-
-      idx=$((idx+1))
-    done
-
-    # stable ordering by chosen tids
-    for tid in "${chosen[@]}"; do
-      ip="${TID2PEER[$tid]:-}"
-      [[ -n "$ip" ]] || continue
-      [[ -n "${ip2ports[$ip]:-}" ]] || continue
-      echo "${ip}:${ip2ports[$ip]}"
-    done
-  } > "$tmp_ports"
+    # Write temp gost_ports
+  if ! distribute_ports_weighted_unique "$PORTS_CSV" "${chosen[@]}" > "$tmp_ports"; then
+    echo "[gost-autobalance] Failed to build gost_ports (unexpected)."
+    exit 0
+  fi
 
   if [[ ! -s "$tmp_ports" ]]; then
     echo "[gost-autobalance] Failed to build gost_ports (unexpected)."
