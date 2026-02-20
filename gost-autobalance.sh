@@ -236,8 +236,8 @@ refresh_tunnel_map() {
 write_gost_ports() {
   local -a backends=("$@")
   local ports_csv="$PORTS_CSV"
-  IFS=',' read -r -a ports <<< "$ports_csv"
-  unset IFS
+  local -a ports=()
+  mapfile -t ports < <(parse_ports_weighted "$ports_csv")
 
   (( ${#backends[@]} > 0 )) || return 1
 
@@ -280,9 +280,16 @@ write_gost_ports() {
   return 0
 }
 
-# Build gost args file exactly like your snippet
+# Build gost args file exactly like your snippet (safe + atomic)
 rebuild_gost_args_and_restart() {
-  : > "$GOST_ARGS_FILE"
+  local tmp_args prev_args
+  tmp_args="$(mktemp)"
+  prev_args="$(mktemp)"
+
+  # backup current args (if any)
+  [[ -f "$GOST_ARGS_FILE" ]] && cp -a "$GOST_ARGS_FILE" "$prev_args" || true
+
+  : > "$tmp_args"
   while IFS= read -r rawline; do
     line="$(printf '%s' "$rawline" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [[ -z "$line" ]] && continue
@@ -295,13 +302,37 @@ rebuild_gost_args_and_restart() {
     for p in "${ports[@]}"; do
       p="$(printf '%s' "$p" | tr -d '[:space:]')"
       [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
-      printf ' -L=tcp://:%s/[%s]:%s' "$p" "$ip" "$p" >> "$GOST_ARGS_FILE"
+      printf ' -L=tcp://:%s/[%s]:%s' "$p" "$ip" "$p" >> "$tmp_args"
     done
     unset IFS
   done < "$GOST_PORTS_FILE"
 
-  systemctl restart "$GOST_SERVICE"
+  # Safety: never restart gost if args is empty (would stop listening)
+  if ! grep -q -- ' -L=tcp://' "$tmp_args"; then
+    echo "[gost-autobalance] WARN: generated gost args is empty. Keeping previous args; not restarting gost."
+    rm -f "$tmp_args" "$prev_args"
+    return 1
+  fi
+
+  # atomic replace
+  install -m 0644 "$tmp_args" "$GOST_ARGS_FILE"
+  rm -f "$tmp_args"
+
+  # restart gost (rollback on failure)
+  if ! systemctl restart "$GOST_SERVICE"; then
+    echo "[gost-autobalance] WARN: gost service restart failed; rolling back args and retrying."
+    if [[ -s "$prev_args" ]]; then
+      install -m 0644 "$prev_args" "$GOST_ARGS_FILE"
+      systemctl restart "$GOST_SERVICE" || true
+    fi
+    rm -f "$prev_args"
+    return 1
+  fi
+
+  rm -f "$prev_args"
+  return 0
 }
+
 
 files_equal() {
   local a="$1" b="$2"
@@ -561,8 +592,8 @@ main() {
   {
     # Generate in memory similar to write_gost_ports but to tmp
     local ports_csv="$PORTS_CSV"
-    IFS=',' read -r -a ports <<< "$ports_csv"
-    unset IFS
+    local -a ports=()
+    mapfile -t ports < <(parse_ports_weighted "$ports_csv")
 
     declare -A ip2ports=()
     local idx=0
@@ -607,9 +638,11 @@ main() {
   install -m 0644 "$tmp_ports" "$GOST_PORTS_FILE"
 
   # Rebuild args and restart
-  rebuild_gost_args_and_restart
-
-  echo "[gost-autobalance] Updated mapping using GRE: ${chosen[*]}"
+  if rebuild_gost_args_and_restart; then
+    echo "[gost-autobalance] Updated mapping using GRE: ${chosen[*]}"
+  else
+    echo "[gost-autobalance] Mapping updated, but gost restart was skipped/failed (see warnings)."
+  fi
 }
 
 cmd="${1:-apply}"
