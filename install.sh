@@ -45,8 +45,6 @@ restore_latest_backup() {
   [[ -d "$dir" ]] || return 0
   [[ -f "$dir/gost_ports.txt" ]] && cp -a "$dir/gost_ports.txt" "$GOST_PORTS_FILE"
   [[ -f "$dir/gost_args.conf" ]]  && cp -a "$dir/gost_args.conf"  "$GOST_ARGS_FILE"
-  # کانفیگ رو معمولاً restore نمی‌کنیم مگر بخوای؛ ولی اگر خواستی این خط رو باز کن:
-  # [[ -f "$dir/gost_autobalance.conf" ]] && cp -a "$dir/gost_autobalance.conf" "$CONF"
 }
 
 install_flow() {
@@ -101,7 +99,6 @@ install_flow() {
   mkdir -p "$STATE_DIR"
   backup_files
 
-  # install main binary from repo
   tmp="$(mktemp)"
   fetch "${REPO_RAW_BASE}/gost-autobalance" "$tmp"
   install -m 0755 "$tmp" "$BIN"
@@ -168,7 +165,6 @@ remove_flow() {
   rm -f "$TIMER" "$SERVICE"
   systemctl daemon-reload || true
 
-  # restore previous files if exist
   restore_latest_backup
 
   rm -f "$CONF" "$BIN"
