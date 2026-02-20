@@ -29,6 +29,7 @@ ping_loss_pct_fast() {
   local dst_ip="$2"
   local out loss
 
+  # faster than your GRE script; enough for decision-making
   out=$(/bin/ping -c 20 -i 0.2 -W 1 -w 6 -I "$src_ip" "$dst_ip" 2>&1 || true)
   loss=$(echo "$out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | head -n1 | cut -d% -f1 || true)
   if [[ -z "${loss:-}" ]]; then
@@ -50,23 +51,27 @@ discover_gre_ifaces() {
     | sort -u
 }
 
+# Get tunnel id number from iface name
 iface_id() {
   local ifc="$1"
   echo "$ifc" | sed -E 's/^gre-(ir|kh)-([0-9]+)$/\2/'
 }
 
+# Get local tunnel IP (without /mask)
 iface_local_tun_ip() {
   local ifc="$1"
   /sbin/ip -o -4 addr show dev "$ifc" 2>/dev/null \
     | awk '{print $4}' | cut -d/ -f1 | head -n1 || true
 }
 
+# State tracking per tunnel id: usable=0/1 + streak seconds
 state_file() { echo "$STATE_DIR/tunnel_${1}.state"; }
 
 load_state() {
   local tid="$1"
   local f; f="$(state_file "$tid")"
   if [[ -f "$f" ]]; then
+    # usable=1 bad=0 good=0 last=epoch
     # shellcheck disable=SC1090
     source "$f"
   else
@@ -111,6 +116,7 @@ update_state_for_result() {
   save_state "$tid"
 }
 
+# Build desired backend set: choose lowest WANT_N usable tunnel IDs
 select_backends() {
   local -a all_ids=("$@")
   local -a usable_ids=()
@@ -122,6 +128,7 @@ select_backends() {
     fi
   done
 
+  # sort numeric
   IFS=$'\n' usable_ids=($(printf "%s\n" "${usable_ids[@]}" | sort -n))
   unset IFS
 
@@ -136,6 +143,7 @@ select_backends() {
   printf "%s\n" "${picked[@]}"
 }
 
+# Map tid -> peer_tun_ip
 declare -A TID2PEER=()
 declare -A TID2IFACE=()
 declare -A TID2LOCAL=()
@@ -163,6 +171,55 @@ refresh_tunnel_map() {
   done < <(discover_gre_ifaces || true)
 }
 
+# Generate /etc/gost_ports.txt based on selected tids + ports distribution
+write_gost_ports() {
+  local -a backends=("$@")
+  local ports_csv="$PORTS_CSV"
+  IFS=',' read -r -a ports <<< "$ports_csv"
+  unset IFS
+
+  (( ${#backends[@]} > 0 )) || return 1
+
+  # round-robin distribution
+  declare -A ip2ports=()
+  local idx=0
+  local p tid ip
+  for p in "${ports[@]}"; do
+    p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+
+    tid="${backends[$(( idx % ${#backends[@]} ))]}"
+    ip="${TID2PEER[$tid]:-}"
+    [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
+
+    if [[ -z "${ip2ports[$ip]:-}" ]]; then
+      ip2ports["$ip"]="$p"
+    else
+      ip2ports["$ip"]+=",${p}"
+    fi
+    idx=$((idx+1))
+  done
+
+  # stable ordering by tid numeric
+  local tmp; tmp="$(mktemp)"
+  for tid in "${backends[@]}"; do
+    ip="${TID2PEER[$tid]:-}"
+    [[ -n "$ip" ]] || continue
+    [[ -n "${ip2ports[$ip]:-}" ]] || continue
+    echo "${ip}:${ip2ports[$ip]}" >> "$tmp"
+  done
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  install -m 0644 "$tmp" "$GOST_PORTS_FILE"
+  rm -f "$tmp"
+  return 0
+}
+
+# Build gost args file exactly like your snippet
 rebuild_gost_args_and_restart() {
   : > "$GOST_ARGS_FILE"
   while IFS= read -r rawline; do
@@ -185,6 +242,12 @@ rebuild_gost_args_and_restart() {
   systemctl restart "$GOST_SERVICE"
 }
 
+files_equal() {
+  local a="$1" b="$2"
+  [[ -f "$a" && -f "$b" ]] || return 1
+  cmp -s "$a" "$b"
+}
+
 main() {
   refresh_tunnel_map
 
@@ -199,9 +262,12 @@ main() {
     exit 0
   fi
 
+  # sort tids numeric
   IFS=$'\n' tids=($(printf "%s\n" "${tids[@]}" | sort -n))
   unset IFS
 
+  # Evaluate each tunnel quickly (loss test), update state with step=INTERVAL
+  # (we approximate streak seconds by interval; good enough)
   local loss local_ip peer_ip is_good
   for tid in "${tids[@]}"; do
     local_ip="${TID2LOCAL[$tid]:-}"
@@ -212,10 +278,15 @@ main() {
     fi
 
     loss="$(ping_loss_pct_fast "$local_ip" "$peer_ip")"
-    if (( loss <= LOSS_THRESH )); then is_good=1; else is_good=0; fi
+    if (( loss <= LOSS_THRESH )); then
+      is_good=1
+    else
+      is_good=0
+    fi
     update_state_for_result "$tid" "$is_good" "$INTERVAL"
   done
 
+  # Pick best backends
   mapfile -t chosen < <(select_backends "${tids[@]}" || true)
 
   if (( ${#chosen[@]} == 0 )); then
@@ -223,10 +294,14 @@ main() {
     exit 0
   fi
 
+  # Build new gost_ports in temp and compare
   local tmp_ports; tmp_ports="$(mktemp)"
-  trap 'rm -f "$tmp_ports"' EXIT
+  local tmp_args;  tmp_args="$(mktemp)"
+  trap 'rm -f "$tmp_ports" "$tmp_args"' EXIT
 
+  # Write temp gost_ports
   {
+    # Generate in memory similar to write_gost_ports but to tmp
     local ports_csv="$PORTS_CSV"
     IFS=',' read -r -a ports <<< "$ports_csv"
     unset IFS
@@ -237,17 +312,21 @@ main() {
     for p in "${ports[@]}"; do
       p="$(printf '%s' "$p" | tr -d '[:space:]')"
       [[ "$p" =~ ^[0-9]{1,5}$ ]] || continue
+
       tid="${chosen[$(( idx % ${#chosen[@]} ))]}"
       ip="${TID2PEER[$tid]:-}"
       [[ -n "$ip" ]] || { idx=$((idx+1)); continue; }
+
       if [[ -z "${ip2ports[$ip]:-}" ]]; then
         ip2ports["$ip"]="$p"
       else
         ip2ports["$ip"]+=",${p}"
       fi
+
       idx=$((idx+1))
     done
 
+    # stable ordering by chosen tids
     for tid in "${chosen[@]}"; do
       ip="${TID2PEER[$tid]:-}"
       [[ -n "$ip" ]] || continue
@@ -261,11 +340,15 @@ main() {
     exit 0
   fi
 
+  # If no change, do nothing
   if [[ -f "$GOST_PORTS_FILE" ]] && cmp -s "$tmp_ports" "$GOST_PORTS_FILE"; then
     exit 0
   fi
 
+  # Apply new ports file
   install -m 0644 "$tmp_ports" "$GOST_PORTS_FILE"
+
+  # Rebuild args and restart
   rebuild_gost_args_and_restart
 
   echo "[gost-autobalance] Updated mapping using GRE: ${chosen[*]}"
