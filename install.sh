@@ -213,8 +213,9 @@ remove_flow() {
   echo "=== gost-autobalance :: REMOVE ==="
   echo "NOTE: gost binary (/usr/local/bin/gost) is NOT touched."
 
-  systemctl stop gost-autobalance.timer 2>/dev/null || true
   systemctl disable gost-autobalance.timer 2>/dev/null || true
+  systemctl stop gost-autobalance.timer 2>/dev/null || true
+  systemctl disable gost-autobalance.service 2>/dev/null || true
   systemctl stop gost-autobalance.service 2>/dev/null || true
 
   rm -f "$TIMER" "$SERVICE"
